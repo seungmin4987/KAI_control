@@ -5,6 +5,7 @@
 #include <ros.h>
 #include <std_msgs/Float32.h>
 #include <ESP32Servo.h>
+#include <ACAN_ESP32.h>
 
 //=======================상수 정의 ==============================
 const unsigned long encoder_time_interval = 100;        // 0.1초 간격으로 엔코더 데이터 읽기
@@ -22,31 +23,39 @@ const int ENCODER_RESOLUTION = 1024;                   // 엔코더 분해능
 #define STEERING_CAN_RX 6
 #define ESTOP_PIN 7
 #define ASMS_MODE_PIN 8
+#define RECV_CH1_PIN 19  // CH1: 속도
 //==============================================================
 
 Encoder enc(ENCODER_PIN_A, ENCODER_PIN_B, SINGLE, 250); // 엔코더 설정
-
 ros::NodeHandle nh;
 std_msgs::Float32 rpm_msg;
 ros::Publisher pub("encoder_rpm", &rpm_msg);
 
 SemaphoreHandle_t xMutex;  // 뮤텍스 핸들 선언
 
-Servo brake_servo; // 서보모터 객체 생성
-
 TaskHandle_t controlTaskHandle = NULL; // 제어 태스크 핸들 선언
 
-//=======================함수 시그니처 ==========================
-float calculatePID(float setpoint, float current_value, float kp, float ki, float kd, float &last_error, float &integral);
+float g_current_rpm = 0.0;
+Servo brake_servo;  // 서보모터 객체 생성
 
+float targetAngle = 0.0;
+int targetAngleInt = 0;
+unsigned long lastUpdateTime = 0;
+bool isMotorActivated = false;
+
+//=======================함수 시그니처 ==========================
 void vEncoderTask(void *pvParameters);
 void vCommunicationTask(void *pvParameters);
-void vControlTask(void *pvParameters);
-void longitudinalControl(float setpoint, float kp, float ki, float kd); // 제어 작업을 수행하는 함수
+void vControlTask(void *pvParameters); //태스크
 
-int getBrakeAngle(float pid_output); // 룩업 테이블 함수
+float calculatePID(float setpoint, float current_value, float kp, float ki, float kd, float &last_error, float &integral);
+void longitudinalControl(float setpoint, float kp, float ki, float kd); // 제어 작업을 수행하는 함수
+void lateralControl(int targetAngleInt); // 횡방향 제어 작업을 수행하는 함수
+int getBrakeAngle(float pid_output); // 브레이크 룩업 테이블 함수
 void stopControlTask(); // 제어 태스크 중단 및 안전 상태 설정
 void resumeControlTask(); // 제어 태스크 재시작
+void sendTargetAngleMsg(int targetAngleInt); // 목표 각도 CAN 메시지 전송 함수
+void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result); // CAN 설정 출력 함수
 //==============================================================
 
 void setup() {
@@ -77,8 +86,8 @@ void setup() {
     }
 
     // 서보모터 초기화
-    brake_servo.attach(BRAKE_SERVO_PIN);
-    brake_servo.write(0); // 초기 위치 설정 (0도: 브레이크 해제 상태)
+    brake_servo.attach(BRAKE_SERVO_PIN);  // 서보모터 핀 설정
+    brake_servo.write(0);  // 초기 위치 설정 (0도)
 
     // FreeRTOS 태스크 생성
     xTaskCreatePinnedToCore(vEncoderTask, "EncoderTask", 1024, NULL, 3, NULL, 1);  // 코어 1에 할당, 우선순위 3 (높음)
@@ -100,11 +109,11 @@ void vEncoderTask(void *pvParameters) {
             pulse_count = enc.getTicks();  // 엔코더에서 펄스 수 읽기
 
             if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {  // 뮤텍스 획득
-                float g_current_rpm = (pulse_count / (float)ENCODER_RESOLUTION) * 60 * (1000 / (float)encoder_time_interval) * GEAR_RATIO;
+                g_current_rpm = (pulse_count / (float)ENCODER_RESOLUTION) * 60 * (1000 / (float)encoder_time_interval) * GEAR_RATIO;
                 xSemaphoreGive(xMutex);  // 뮤텍스 해제
             }
 
-            enc.reset();  // 다음 주기에서 펄스 카운트를 재설정
+            enc.resetTicks();  // 펄스 카운트를 초기화
         }
 
         last_time = current_time;  // 시간 업데이트
@@ -171,25 +180,43 @@ void vControlTask(void *pvParameters) {
     for (;;) {
         current_time = millis();
         if (current_time - last_time >= control_time_interval) {
-            longitudinalControl(setpoint, kp, ki, kd);  // 제어 작업을 함수로 수행
-        }
+            // 종방향 제어
+            longitudinalControl(setpoint, kp, ki, kd);  // 종방향 제어 수행
 
-        last_time = current_time;  // 시간 업데이트
+            // 횡방향 제어
+            if (!isMotorActivated && millis() - lastUpdateTime < 1000) {
+                // 1초 동안 모터 활성화 메시지 전송
+                sendTargetAngleMsg(0);  // 모터 활성화 메시지 전송
+            } else {
+                isMotorActivated = true; // 1초 후 모터 활성화 완료
+                if (millis() - lastUpdateTime > lateral_control_interval) {
+                    // 100ms마다 실행
+                    float targetAngle = ((pulseIn(RECV_CH1_PIN, HIGH, 50000) - 1000.0) / 1100.0) * 10000;
+                    targetAngleInt = (int)targetAngle;
+
+                    lateralControl(targetAngleInt);  // 횡방향 제어 수행
+
+                    Serial.println(targetAngleInt);
+                    lastUpdateTime = millis();  // 시간 업데이트
+                }
+            }
+
+            last_time = current_time;  // 시간 업데이트
+        }
 
         // 주기적으로 실행
         vTaskDelay(1 / portTICK_PERIOD_MS); // 짧은 지연으로 다른 태스크에 CPU 시간을 양보
     }
 }
-//==============================================================
 
 //======================= longitudinalControl 함수 =======================
 void longitudinalControl(float setpoint, float kp, float ki, float kd) {
-    float pid_output = 0.0;
+    int pid_output = 0;
     float last_error = 0.0;
     float integral = 0.0;
 
     if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {  // 뮤텍스 획득
-        pid_output = calculatePID(setpoint, g_current_rpm, kp, ki, kd, last_error, integral);  // PID 계산
+        pid_output = (int) calculatePID(setpoint, g_current_rpm, kp, ki, kd, last_error, integral);  // PID 계산
         xSemaphoreGive(xMutex);  // 뮤텍스 해제
     }
 
@@ -203,8 +230,14 @@ void longitudinalControl(float setpoint, float kp, float ki, float kd) {
         
         // 브레이크 제어
         int brake_angle = getBrakeAngle(abs(pid_output)); // 룩업 테이블로 브레이크 각도 결정
-        brake_servo.write(brake_angle); // 서보모터로 브레이크 제어
+        brake_servo.write(brake_angle);  // 서보모터로 브레이크 제어
     }
+}
+//==============================================================
+
+//======================= lateralControl 함수 =======================
+void lateralControl(int targetAngleInt) {
+    sendTargetAngleMsg(targetAngleInt);  // 목표 각도 값 전송
 }
 //==============================================================
 
@@ -259,5 +292,68 @@ float calculatePID(float setpoint, float current_value, float kp, float ki, floa
 }
 //==============================================================
 
-void loop() {}
+//======================= sendTargetAngleMsg 함수 =====================
+void sendTargetAngleMsg(int targetAngleInt) {
+    CANMessage frame;
 
+    frame.id = 0x06000001;
+    frame.ext = true; // 확장 ID 사용 여부 설정
+    frame.rtr = false; // 데이터 프레임
+    frame.len = 8; // 보낼 데이터의 길이
+
+    // 바이트 순서를 맞추기 위해 명령어와 데이터를 결합
+    frame.data[0] = 0x23;
+    frame.data[1] = 0x02;
+    frame.data[2] = 0x20;
+    frame.data[3] = 0x01;
+    frame.data[4] = (targetAngleInt >> 24) & 0xFF;
+    frame.data[5] = (targetAngleInt >> 16) & 0xFF;
+    frame.data[6] = (targetAngleInt >> 8) & 0xFF;
+    frame.data[7] = targetAngleInt & 0xFF;
+
+    // 전송
+    if (ACAN_ESP32::can.tryToSend(frame)) {
+        Serial.println("데이터 전송 성공");
+        Serial.print("전송된 데이터: ");
+        for (int i = 0; i < 8; i++) {
+            Serial.print(frame.data[i], HEX);
+            Serial.print(" ");
+        }
+        Serial.println();
+    }
+}
+//==============================================================
+
+//======================= printCANSettings 함수 =====================
+void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result) {
+    if (result == 0) {    
+        Serial.print("Bit Rate prescaler: ");
+        Serial.println(settings.mBitRatePrescaler);
+        Serial.print("Time Segment 1:     ");
+        Serial.println(settings.mTimeSegment1);
+        Serial.print("Time Segment 2:     ");
+        Serial.println(settings.mTimeSegment2);
+        Serial.print("RJW:                ");
+        Serial.println(settings.mRJW);
+        Serial.print("Triple Sampling:    ");
+        Serial.println(settings.mTripleSampling ? "yes" : "no");
+        Serial.print("Actual bit rate:    ");
+        Serial.print(settings.actualBitRate());
+        Serial.println(" bit/s");
+        Serial.print("Exact bit rate ?    ");
+        Serial.println(settings.exactBitRate() ? "yes" : "no");
+        Serial.print("Distance            ");
+        Serial.print(settings.ppmFromDesiredBitRate());
+        Serial.println(" ppm");
+        Serial.print("Sample point:       ");
+        Serial.print(settings.samplePointFromBitStart());
+        Serial.println("%");
+        Serial.println("Configuration OK!");
+    } else {
+        Serial.print("Configuration error 0x");
+        Serial.println(result, HEX);    
+    }
+}
+//==============================================================
+
+void loop() {}
