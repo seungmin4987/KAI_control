@@ -27,12 +27,10 @@ enum Mode { AUTONOMOUS, EMERGENCY, MANUAL }; // 모드 정의
 #define BRAKE_SERVO_PIN 4 // 브레이크 서보 제어 핀
 #define ENCODER_PIN_A 18 // 엔코더 A핀
 #define ENCODER_PIN_B 19 // 엔코더 B핀
-#define STEERING_CAN_TX 5
-#define STEERING_CAN_RX 6
-#define ESTOP_PIN 7 // E-Stop 버튼 핀 번호
-#define ASMS_MODE_PIN 8
-#define BUTTON_PIN 25 // 토글 스위치 핀 번호 (자율주행/비상 모드 전환용)
-#define LEVER_SWITCH_PIN 26 // 레버 스위치 핀 번호 (자율주행/수동 모드 전환용)
+#define STEERING_CAN_TX 16
+#define STEERING_CAN_RX 17
+#define ESTOP_PIN 7 // E-Stop 버튼 핀 번호 (자율주행/비상 모드 전환용)
+#define ASMS_MODE_PIN 8 // 레버 스위치 핀 번호 (자율주행/수동 모드 전환용)
 //=========================================================================================
 
 
@@ -100,7 +98,7 @@ void IRAM_ATTR handleEStop();  // E-Stop ISR
 void setup() {
     Serial.begin(115200);
     // 캔통신 초기화 및 설정 (예: RX: 17번 핀, TX: 16번 핀, 250kbps 통신 속도)
-    setupCANCommunication(17, 16, 250000UL); 
+    setupCANCommunication(STEERING_CAN_RX, STEERING_CAN_TX, 250000UL); 
     //추후 여기에 스티어링 모터 활성화 기능 추가할 예정
 
     if (enc.init()) {
@@ -131,6 +129,8 @@ void setup() {
         while (1);
     }
 
+    //pinMode(MOTOR_PWM_PIN, OUTPUT); // 아날로그 라이트는 핀모드 설정 안해도 됨
+
     // 서보모터 초기화
     g_brake_servo.attach(BRAKE_SERVO_PIN); // 50Hz로 서보모터 제어, 가능하면 높은 주파수도 사용해보기
     g_brake_servo.write(0);  // 초기 위치 설정 (0도)
@@ -140,7 +140,7 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), handleEStop, FALLING);
 
     // ASMS 스위치 핀 초기화
-    pinMode(LEVER_SWITCH_PIN, INPUT_PULLUP);
+    pinMode(ASMS_MODE_PIN, INPUT_PULLUP);
 
     // FreeRTOS 태스크 생성
     xTaskCreatePinnedToCore(vControlTask, "ControlTask", 1024, NULL, 1, &g_controlTaskHandle, 0);   // 코어 0에 할당, 우선순위 1(낮음)
@@ -408,7 +408,7 @@ void IRAM_ATTR handleEStop() {
 //======================== 폴링 스위치 ==========================
 void check_ASMS_Mode(bool* lastLeverState) {
 
-    int currentLeverState = digitalRead(LEVER_SWITCH_PIN);
+    int currentLeverState = digitalRead(ASMS_MODE_PIN);
 
     if (currentLeverState != *lastLeverState) {
         if (currentLeverState == LOW && g_currentMode == AUTONOMOUS) {
