@@ -17,7 +17,7 @@ const float GEAR_RATIO = 5.0;                          // 기어비 1:5
 const int ENCODER_RESOLUTION = 1024;                   // 엔코더 분해능
 const int debounceDelay = 50;                          // 스위치 디바운스 지연 시간 (밀리초)
 
-enum Mode { AUTONOMOUS, EMERGENCY, MANUAL }; // 모드 정의
+enum Mode { AUTONOMOUS, EMERGENCY, MANUAL }; // 모드 정의 0 , 1 , 2
 
 //=======================================================================================
 
@@ -36,7 +36,7 @@ enum Mode { AUTONOMOUS, EMERGENCY, MANUAL }; // 모드 정의
 
 //=========================================================================================
 Encoder enc(ENCODER_PIN_A, ENCODER_PIN_B, SINGLE, 250); // 엔코더 생성자
-Servo g_brake_servo;  // 서보모터 객체 생성
+Servo brake_servo;  // 서보모터 객체 생성
 
 ros::NodeHandle nh; // ros 노드 핸들러
 custom_msg_pkg::FeedbackMsg feedback_msg;  // 피드백 메시지 객체
@@ -51,7 +51,6 @@ void vCommunicationTask(void *pvParameters); // 통신 태스크
 
 SemaphoreHandle_t g_xMutexCurrentRPM;  // 엔코더 RPM 관련 뮤텍스
 SemaphoreHandle_t g_xMutexTargetValues;  // 목표 값(목표 RPM, 목표 각도) 관련 뮤텍스
-TaskHandle_t g_controlTaskHandle = NULL; // 제어 태스크 핸들 선언
 //==========================================================================================
 
 
@@ -71,10 +70,14 @@ float g_target_rpm = 0.0;   // 목표 RPM
 int g_target_angle_int = 0; // 목표 핸들 각도
 //==========================================================================================
 
+void vControlTask(void *pvParameters); // 제어 태스크
+void vEncoderTask(void *pvParameters); // 엔코더 읽기 태스크 
+void vCommunicationTask(void *pvParameters); // 통신 태스크
 
-//=======================함수 시그니처 ========================================================
+
+//=================================함수 선언부 ===============================================
 void longitudinalControl(float target_rpm, float kp, float ki, float kd); // 종방향 제어 함수
-float calculatePID(float target_rpm, float kp, float ki, float kd);
+float calculatePID(float target_rpm, float kp, float ki, float kd); // PID 계산 함수
 int getBrakeAngle(float pid_output); // 브레이크 룩업 테이블 함수
 
 void lateralControl(int targetAngleInt); // 횡방향 제어 함수
@@ -84,16 +87,13 @@ void controlCallback(const custom_msg_pkg::ControlMsg& msg);  // 커스텀 메�
 void setupCANCommunication(int rxPin, int txPin, uint32_t baudRate); // 캔통신 활성화
 void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result); // 캔통신 세팅값 디버깅 출력
 
-void activateEmergencyMode();  // 긴급 모드 활성화 함수
-void deactivateEmergencyMode();  // 긴급 모드 비활성화 함수
-
-void deactivateAutonomousMode();  // 자율 모드 비활성화 함수 (수동 주행 모드 전환 시 호출)
-void activateAutonomousMode();  // 자율 모드 활성화 함수 (자율주행 모드로 전환 시 호출)
-
-void stopControlTask(); // 제어 태스크 중단 함수
-void resumeControlTask(); // 제어 태스크 재시작 함수 
-void IRAM_ATTR handleEStop();  // E-Stop ISR
+void IRAM_ATTR EStop_Activate_ISR();  // E-Stop 활성화 ISR
+void IRAM_ATTR EStop_Deactivate_ISR();  // E-Stop 비활성화 ISR
+void update_ASMS_Mode(bool* lastLeverState, unsigned long current_time, const unsigned long falling_debounce_delay) // ASMS 모드 업데이트 함수
+Mode check_ASMS_mode(); // 현재 모드를 반환하는 함수
 //===========================================================================================
+
+
 
 void setup() {
     Serial.begin(115200);
@@ -132,12 +132,12 @@ void setup() {
     //pinMode(MOTOR_PWM_PIN, OUTPUT); // 아날로그 라이트는 핀모드 설정 안해도 됨
 
     // 서보모터 초기화
-    g_brake_servo.attach(BRAKE_SERVO_PIN); // 50Hz로 서보모터 제어, 가능하면 높은 주파수도 사용해보기
-    g_brake_servo.write(0);  // 초기 위치 설정 (0도)
+    brake_servo.attach(BRAKE_SERVO_PIN); // 50Hz로 서보모터 제어, 가능하면 높은 주파수도 사용해보기
+    brake_servo.write(0);  // 초기 위치 설정 (0도)
 
     // E-Stop 핀 초기화 및 인터럽트 설정
     pinMode(ESTOP_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), handleEStop, FALLING);
+    attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), EStop_ISR, FALLING);
 
     // ASMS 스위치 핀 초기화
     pinMode(ASMS_MODE_PIN, INPUT_PULLUP);
@@ -152,8 +152,11 @@ void setup() {
 void vControlTask(void *pvParameters) { 
     unsigned long last_time = 0;
     unsigned long current_time = 0;
+    const unsigned long falling_debounce_delay = 500;
 
     bool lastLeverState = LOW; // 레버 스위치의 이전 상태
+
+    Mode current_mode;
 
     // PID 게인 설정
     float kp = 1.0;
@@ -161,11 +164,16 @@ void vControlTask(void *pvParameters) {
     float kd = 0.01;
 
     for (;;) {
-        current_time = millis();
-        check_EMERGENCY_mode();
+      current_time = millis();
 
+      update_ASMS_Mode(&lastLeverState, current_time, falling_debounce_delay);
+
+      if((current_mode = check_ASMS_Mode(&lastLeverState))== EMERGENCY){
+          brake_servo.write(30);  // 비상 정지
+          vTaskDelay(100 / portTICK_PERIOD_MS); // 비상정지 모드에서는 CPU 부하를 낮추기 위해 0.1초 딜레이
+      }
+      else if(current_mode == AUTONOMOUS){        
         if (current_time - last_time >= control_time_interval) {
-            check_ASMS_Mode(&lastLeverState);
 
             float local_target_rpm;
             int local_target_angle_int;
@@ -175,17 +183,20 @@ void vControlTask(void *pvParameters) {
                 local_target_rpm = g_target_rpm;
                 local_target_angle_int = g_target_angle_int;
                 xSemaphoreGive(g_xMutexTargetValues);
-            }
-
-            // 종방향 제어 수행
-            longitudinalControl(local_target_rpm, kp, ki, kd);
-            // 횡방향 제어 수행
-            lateralControl(local_target_angle_int);
+            } 
+            longitudinalControl(local_target_rpm, kp, ki, kd); // 종방향 제어 수행
+            lateralControl(local_target_angle_int);  // 횡방향 제어 수행
 
             last_time = current_time;  // 시간 업데이트
         }
-        // 주기적으로 실행
-        vTaskDelay(1 / portTICK_PERIOD_MS); // 짧은 지연으로 다른 태스크에 CPU 시간을 양보
+      }
+      else{ // 수동 주행모드에서는 CPU 부하를 낮추기 위해 0.1초 딜레이
+        brake_servo.write(0);          // 브레이크 신호 0
+        analogWrite(MOTOR_PWM_PIN, 0); // 스로틀 신호 0
+        vTaskDelay(100 / portTICK_PERIOD_MS); 
+        } 
+
+      vTaskDelay(1 / portTICK_PERIOD_MS); // 짧은 지연으로 다른 태스크에 CPU 시간을 양보
     }
 }
 
@@ -271,7 +282,7 @@ void longitudinalControl(float target_rpm, float kp, float ki, float kd) {
     } else {
         analogWrite(MOTOR_PWM_PIN, 0); // 모터 PWM 출력 0으로 설정
         int brake_angle = getBrakeAngle(abs(pid_output)); // 브레이크 각도 결정
-        g_brake_servo.write(brake_angle);  // 서보모터로 브레이크 제어
+        brake_servo.write(brake_angle);  // 서보모터로 브레이크 제어
     }
 }
 
@@ -400,71 +411,51 @@ void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result) {
 }
 
 //======================= E-Stop 스위치 ISR ====================
-void IRAM_ATTR handleEStop() {
-    g_estopActivated = true;  // E-Stop 활성화
-    Serial.println("E-Stop Activated!");
+
+void IRAM_ATTR EStop_Debounce(bool activate) {
+    static unsigned long last_time = 0;
+    unsigned long current_time = millis();
+    if (current_time - last_time >= debounceDelay) {
+        g_estopActivated = activate;
+        last_time = current_time;
+    }
+}
+
+void IRAM_ATTR EStop_Activate_ISR() {
+    portENTER_CRITICAL_ISR();  // 인터럽트 비활성화
+    EStop_Debounce(true);      // E-Stop 활성화
+    portEXIT_CRITICAL_ISR();   // 인터럽트 활성화
+}
+
+void IRAM_ATTR EStop_Deactivate_ISR() {
+    portENTER_CRITICAL_ISR();  // 인터럽트 비활성화
+    EStop_Debounce(false);     // E-Stop 비활성화
+    portEXIT_CRITICAL_ISR();   // 인터럽트 활성화
 }
 
 //======================== 폴링 스위치 ==========================
-void check_ASMS_Mode(bool* lastLeverState) {
+void update_ASMS_Mode(bool* lastLeverState, unsigned long current_time, const unsigned long falling_debounce_delay) {
 
-    int currentLeverState = digitalRead(ASMS_MODE_PIN);
-
-    if (currentLeverState != *lastLeverState) {
-        if (currentLeverState == LOW && g_currentMode == AUTONOMOUS) {
-            g_currentMode = MANUAL;
-            Serial.println("Switching to Manual Driving Mode");
-            deactivateAutonomousMode();
-        } else if (currentLeverState == HIGH && g_currentMode == MANUAL) {
-            g_currentMode = AUTONOMOUS;
-            Serial.println("Switching to Autonomous Driving Mode");
-            activateAutonomousMode();
-        }
-    }
-    *lastLeverState = currentLeverState; // 이전 상태 업데이트
-}
-
-void check_EMERGENCY_mode(){
-    // E-Stop이 활성화되면 제어 루프 중단
-    if (g_estopActivated) {
-        activateEmergencyMode();  // 현재 태스크를 일시 중단
+    static unsigned long last_time = 0;
+    if(current_time - last_time >= falling_debounce_delay){
+      bool currentLeverState = digitalRead(ASMS_MODE_PIN);
+      if (currentLeverState != *lastLeverState) {
+          if (currentLeverState == LOW && g_currentMode == AUTONOMOUS) {
+              g_currentMode = MANUAL;
+              *lastLeverState = currentLeverState; // 이전 상태 업데이트
+          } else if (currentLeverState == HIGH && g_currentMode == MANUAL) {
+              g_currentMode = AUTONOMOUS;
+              *lastLeverState = currentLeverState; // 이전 상태 업데이트
+          }
+      }
     }
 }
 
-//======================= stopControlTask 함수 ====================
-void stopControlTask() {
-    if (g_controlTaskHandle != NULL) {
-        vTaskSuspend(g_controlTaskHandle);  // 제어 태스크 중단
-    }
-    analogWrite(MOTOR_PWM_PIN, 0); // 모터 PWM 출력을 0으로 설정
+Mode check_ASMS_mode(){ // 나중에 뮤텍스로 보호하기
+    Mode current_mode = g_currentMode;
+    if(g_estopActivated) current_mode = EMERGENCY;
+    return current_mode; 
 }
 
-//======================= resumeControlTask 함수 ====================
-void resumeControlTask() {
-    if (g_controlTaskHandle != NULL) {
-        vTaskResume(g_controlTaskHandle);  // 제어 태스크 재시작
-    }
-}
-
-//======================= 긴급 모드 활성화 함수 ====================
-void activateEmergencyMode() {
-    stopControlTask();
-    g_brake_servo.write(90); // 브레이크 작동 (각도는 예시)
-}
-
-//======================= 긴급 모드 비활성화 함수 ====================
-void deactivateEmergencyMode() {
-    resumeControlTask(); // 자율 모드로 복귀
-}
-
-//=============== 자율 모드 비활성화 함수(수동 모드 진입) ====================
-void deactivateAutonomousMode() {
-    stopControlTask();
-}
-
-//======================= 자율 모드 활성화 함수 ====================
-void activateAutonomousMode() {
-    resumeControlTask();
-}
 
 void loop() {}
