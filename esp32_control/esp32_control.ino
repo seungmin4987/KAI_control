@@ -1,316 +1,299 @@
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/semphr.h>
-#include "FastInterruptEncoder.h"
-#include <ros.h>
-#include <ESP32Servo.h>
-#include <ACAN_ESP32.h>
-#include <custom_msg_pkg/ControlMsg.h>   // 커스텀 메시지: ControlMsg
-#include <custom_msg_pkg/FeedbackMsg.h>  // 커스텀 메시지: FeedbackMsg
+#include <freertos/FreeRTOS.h>  // FreeRTOS 기본 헤더 파일
+#include <freertos/task.h>  // FreeRTOS 태스크 관리 헤더 파일
+#include <freertos/semphr.h>  // FreeRTOS 세마포어 관리 헤더 파일
+#include "FastInterruptEncoder.h"  // 고속 인터럽트 엔코더 라이브러리
+#include <ros.h>  // ROS 통신을 위한 헤더 파일
+#include <ESP32Servo.h>  // ESP32에서 서보모터 제어를 위한 헤더 파일
+#include <ACAN_ESP32.h>  // ESP32에서 CAN 통신을 위한 헤더 파일
+#include <custom_msg_pkg/ControlMsg.h>   // 커스텀 메시지: ControlMsg를 위한 헤더 파일
+#include <custom_msg_pkg/FeedbackMsg.h>  // 커스텀 메시지: FeedbackMsg를 위한 헤더 파일
 
 //=======================상수 정의 ========================================================
 
-const unsigned long control_time_interval = 100;       // 0.1초 간격으로 제어
-const unsigned long encoder_time_interval = 100;       // 0.1초 간격으로 엔코더 데이터 읽기
-const unsigned long communication_time_interval = 100; // 0.1초 간격으로 통신
-const float GEAR_RATIO = 5.0;                          // 기어비 1:5
-const int ENCODER_RESOLUTION = 1024;                   // 엔코더 분해능
-const int debounceDelay = 50;                          // 스위치 디바운스 지연 시간 (밀리초)
+const unsigned long control_time_interval = 100;  // 제어 태스크 실행 간격(0.1초)
+const unsigned long encoder_time_interval = 100;  // 엔코더 데이터 읽기 간격(0.1초)
+const unsigned long communication_time_interval = 100;  // 통신 태스크 실행 간격(0.1초)
+const float GEAR_RATIO = 5.0;  // 기어비 설정
+const int ENCODER_RESOLUTION = 1024;  // 엔코더 분해능(한 바퀴당 펄스 수)
+const int debounceDelay = 50;  // 스위치 디바운스 지연 시간(밀리초)
 
-enum Mode { AUTONOMOUS, EMERGENCY, MANUAL }; // 모드 정의 0 , 1 , 2
+enum Mode { AUTONOMOUS, EMERGENCY, MANUAL };  // 차량 모드 정의(AUTONOMOUS: 자율주행, EMERGENCY: 비상, MANUAL: 수동)
 
 //=======================================================================================
 
-
 //=======================핀번호 정의=========================================================
-#define MOTOR_PWM_PIN 2 // 모터 속도 제어 핀
-#define BRAKE_SERVO_PIN 4 // 브레이크 서보 제어 핀
-#define ENCODER_PIN_A 18 // 엔코더 A핀
-#define ENCODER_PIN_B 19 // 엔코더 B핀
-#define STEERING_CAN_TX 16
-#define STEERING_CAN_RX 17
-#define ESTOP_PIN 7 // E-Stop 버튼 핀 번호 (자율주행/비상 모드 전환용)
-#define ASMS_MODE_PIN 8 // 레버 스위치 핀 번호 (자율주행/수동 모드 전환용)
+#define MOTOR_PWM_PIN 2  // 모터 속도 제어 핀 번호
+#define BRAKE_SERVO_PIN 4  // 브레이크 서보모터 제어 핀 번호
+#define ENCODER_PIN_A 18  // 엔코더 A 핀 번호
+#define ENCODER_PIN_B 19  // 엔코더 B 핀 번호
+#define STEERING_CAN_TX 21  // 스티어링 CAN 통신 TX 핀 번호
+#define STEERING_CAN_RX 22  // 스티어링 CAN 통신 RX 핀 번호
+#define ESTOP_PIN 7  // 비상 정지(E-Stop) 버튼 핀 번호
+#define ASMS_MODE_PIN 8  // 자율주행/수동 모드 전환 스위치 핀 번호
+#define RESET_PIN 33  // 비상 정지 해제 스위치 핀 번호
 //=========================================================================================
 
-
-//=========================================================================================
-Encoder enc(ENCODER_PIN_A, ENCODER_PIN_B, SINGLE, 250); // 엔코더 생성자
+//========================전역 변수 및 객체 =================================================
+Encoder enc(ENCODER_PIN_A, ENCODER_PIN_B, SINGLE, 250);  // 엔코더 객체 생성 (싱글 모드, 디바운스 시간 250us)
 Servo brake_servo;  // 서보모터 객체 생성
 
-ros::NodeHandle nh; // ros 노드 핸들러
-custom_msg_pkg::FeedbackMsg feedback_msg;  // 피드백 메시지 객체
-ros::Publisher pub("feedback_topic", &feedback_msg);  // 피드백 메시지 퍼블리셔
-//=========================================================================================
+ros::NodeHandle nh;  // ROS 노드 핸들러 객체 생성
+custom_msg_pkg::FeedbackMsg feedback_msg;  // 피드백 메시지 객체 생성
+ros::Publisher pub("feedback_topic", &feedback_msg);  // ROS 퍼블리셔 생성 (피드백 메시지를 'feedback_topic' 토픽에 퍼블리시)
 
+// Critical Section을 위한 MUX 선언
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+//========================함수 선언부 =================================================
+void controlCallback(const custom_msg_pkg::ControlMsg& msg);  // 커스텀 메시지 콜백 함수 선언
+
+// ROS Subscriber 객체를 별도로 정의
+ros::Subscriber<custom_msg_pkg::ControlMsg> control_subscriber("control_topic", &controlCallback);
 
 //==================================== 태스크 선언부 ==========================================
-void vControlTask(void *pvParameters); // 제어 태스크
-void vEncoderTask(void *pvParameters); // 엔코더 읽기 태스크 
-void vCommunicationTask(void *pvParameters); // 통신 태스크
+void vControlTask(void *pvParameters);  // 제어 태스크 함수 선언
+void vEncoderTask(void *pvParameters);  // 엔코더 읽기 태스크 함수 선언
+void vCommunicationTask(void *pvParameters);  // 통신 태스크 함수 선언
 
-SemaphoreHandle_t g_xMutexCurrentRPM;  // 엔코더 RPM 관련 뮤텍스
-SemaphoreHandle_t g_xMutexTargetValues;  // 목표 값(목표 RPM, 목표 각도) 관련 뮤텍스
+SemaphoreHandle_t g_xMutexCurrentRPM;  // 현재 RPM 보호용 세마포어 선언
+SemaphoreHandle_t g_xMutexTargetValues;  // 목표 값 보호용 세마포어 선언
+SemaphoreHandle_t modeSemaphore;  // 모드 전환 보호용 세마포어 선언
 //==========================================================================================
-
 
 //========================모드 전환 스위치=====================================================
-volatile Mode g_currentMode = AUTONOMOUS; // 현재 모드 상태 (초기값은 자율주행 모드)
-volatile bool g_estopActivated = false; // E-Stop 활성화 상태
+volatile Mode g_currentMode = AUTONOMOUS;  // 현재 모드 상태 (초기값은 자율주행 모드)
+volatile bool g_estopActivated = false;  // 비상 정지(E-Stop) 활성화 상태
 //==========================================================================================
-
 
 //======================센서 데이터 ==========================================================
-float g_current_rpm = 0.0; // 현재 RPM
+float g_current_rpm = 0.0;  // 현재 RPM 값
 //==========================================================================================
-
 
 //======================목표 제어값===========================================================
-float g_target_rpm = 0.0;   // 목표 RPM
-int g_target_angle_int = 0; // 목표 핸들 각도
+float g_target_rpm = 0.0;  // 목표 RPM 값
+int g_target_angle_int = 0;  // 목표 핸들 각도 값
 //==========================================================================================
 
-void vControlTask(void *pvParameters); // 제어 태스크
-void vEncoderTask(void *pvParameters); // 엔코더 읽기 태스크 
-void vCommunicationTask(void *pvParameters); // 통신 태스크
-
-
 //=================================함수 선언부 ===============================================
-void longitudinalControl(float target_rpm, float kp, float ki, float kd); // 종방향 제어 함수
-float calculatePID(float target_rpm, float kp, float ki, float kd); // PID 계산 함수
-int getBrakeAngle(float pid_output); // 브레이크 룩업 테이블 함수
+void longitudinalControl(float target_rpm, float kp, float ki, float kd);  // 종방향 제어 함수 선언
+float calculatePID(float target_rpm, float kp, float ki, float kd);  // PID 계산 함수 선언
+int getBrakeAngle(float pid_output);  // 브레이크 각도 결정 함수 선언
 
-void lateralControl(int targetAngleInt); // 횡방향 제어 함수
+void lateralControl(int targetAngleInt);  // 횡방향 제어 함수 선언
 
-void controlCallback(const custom_msg_pkg::ControlMsg& msg);  // 커스텀 메시지 콜백 함수
+void setupCANCommunication(int rxPin, int txPin, uint32_t baudRate);  // CAN 통신 설정 함수 선언
+void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result);  // CAN 통신 설정 디버깅 출력 함수 선언
 
-void setupCANCommunication(int rxPin, int txPin, uint32_t baudRate); // 캔통신 활성화
-void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result); // 캔통신 세팅값 디버깅 출력
+void IRAM_ATTR EStop_Activate_ISR();  // 비상 정지(E-Stop) 활성화 ISR 함수 선언
+void IRAM_ATTR EStop_Deactivate_ISR();  // 비상 정지(E-Stop) 비활성화 ISR 함수 선언
+void update_ASMS_Mode(bool* lastLeverState, unsigned long current_time, const unsigned long falling_debounce_delay);  // ASMS 모드 업데이트 함수 선언
+Mode check_ASMS_mode();  // 현재 모드를 반환하는 함수 선언
 
-void IRAM_ATTR EStop_Activate_ISR();  // E-Stop 활성화 ISR
-void IRAM_ATTR EStop_Deactivate_ISR();  // E-Stop 비활성화 ISR
-void update_ASMS_Mode(bool* lastLeverState, unsigned long current_time, const unsigned long falling_debounce_delay) // ASMS 모드 업데이트 함수
-Mode check_ASMS_mode(); // 현재 모드를 반환하는 함수
+// 자율주행 모드 활성화/비활성화 함수 선언
+void deactivateAutonomousMode();  // 자율주행 모드 해제
+void activateAutonomousMode();  // 자율주행 모드 재활성화
 //===========================================================================================
 
-
-
 void setup() {
-    Serial.begin(115200);
-    // 캔통신 초기화 및 설정 (예: RX: 17번 핀, TX: 16번 핀, 250kbps 통신 속도)
-    setupCANCommunication(STEERING_CAN_RX, STEERING_CAN_TX, 250000UL); 
-    //추후 여기에 스티어링 모터 활성화 기능 추가할 예정
+    Serial.begin(115200);  // 시리얼 통신 초기화
 
-    if (enc.init()) {
-        Serial.println("Encoder Initialization OK");
+    setupCANCommunication(STEERING_CAN_RX, STEERING_CAN_TX, 250000UL);  // CAN 통신 초기화 및 설정 (250kbps)
+
+    if (enc.init()) {  // 엔코더 초기화 시도
+        Serial.println("Encoder Initialization OK");  // 초기화 성공 시 메시지 출력
     } else {
-        Serial.println("Encoder Initialization Failed");
-        while(1);
+        Serial.println("Encoder Initialization Failed");  // 초기화 실패 시 메시지 출력
+        while(1);  // 실패 시 무한 루프
     }
 
-    nh.initNode();
-    nh.advertise(pub);
-    nh.subscribe(ros::Subscriber<custom_msg_pkg::ControlMsg>("control_topic", &controlCallback));
+    nh.initNode();  // ROS 노드 초기화
+    nh.advertise(pub);  // ROS 퍼블리셔 설정
+    nh.subscribe(control_subscriber);  // ROS 구독자 설정
 
-    // ROS 연결 시도
-    while (!nh.connected()) {
-        nh.spinOnce();
-        Serial.println("Connecting to ROS...");
-        delay(1000);  // 1초마다 연결 시도
+    while (!nh.connected()) {  // ROS에 연결될 때까지 대기
+        nh.spinOnce();  // ROS 통신 유지
+        Serial.println("Connecting to ROS...");  // 연결 시도 메시지 출력
+        delay(1000);  // 1초 대기
     }
-    Serial.println("Connected to ROS!");
+    Serial.println("Connected to ROS!");  // ROS 연결 성공 메시지 출력
 
-    g_xMutexCurrentRPM = xSemaphoreCreateMutex();  // 엔코더 RPM 관련 뮤텍스 생성
-    g_xMutexTargetValues = xSemaphoreCreateMutex();  // 목표 값 관련 뮤텍스 생성
+    g_xMutexCurrentRPM = xSemaphoreCreateMutex();  // 현재 RPM 보호용 세마포어 생성
+    g_xMutexTargetValues = xSemaphoreCreateMutex();  // 목표 값 보호용 세마포어 생성
+    modeSemaphore = xSemaphoreCreateMutex();  // 모드 보호용 세마포어 생성
 
-    if (g_xMutexCurrentRPM == NULL || g_xMutexTargetValues == NULL) {
-        Serial.println("Mutex creation failed");
-        //나중에 피드백 메시지로 로그 띄우기 시리얼 프린트가 아니라
-        while (1);
+    if (g_xMutexCurrentRPM == NULL || g_xMutexTargetValues == NULL || modeSemaphore == NULL) {  // 세마포어 생성 실패 시
+        Serial.println("Mutex creation failed");  // 오류 메시지 출력
+        while (1);  // 무한 루프
     }
 
-    //pinMode(MOTOR_PWM_PIN, OUTPUT); // 아날로그 라이트는 핀모드 설정 안해도 됨
+    brake_servo.attach(BRAKE_SERVO_PIN);  // 서보모터 핀 설정 및 초기화
+    brake_servo.write(0);  // 서보모터 초기 위치 설정 (0도)
 
-    // 서보모터 초기화
-    brake_servo.attach(BRAKE_SERVO_PIN); // 50Hz로 서보모터 제어, 가능하면 높은 주파수도 사용해보기
-    brake_servo.write(0);  // 초기 위치 설정 (0도)
+    pinMode(ESTOP_PIN, INPUT);  // 비상 정지(E-Stop) 핀 설정
+    pinMode(RESET_PIN, INPUT);  // 비상 정지 해제 스위치 핀 설정
+    attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), EStop_Activate_ISR, FALLING);  // E-Stop 인터럽트 설정
+    attachInterrupt(digitalPinToInterrupt(RESET_PIN), EStop_Deactivate_ISR, FALLING);  // E-Stop 해제 인터럽트 설정
 
-    // E-Stop 핀 초기화 및 인터럽트 설정
-    pinMode(ESTOP_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), EStop_ISR, FALLING);
-
-    // ASMS 스위치 핀 초기화
-    pinMode(ASMS_MODE_PIN, INPUT_PULLUP);
+    pinMode(ASMS_MODE_PIN, INPUT);  // ASMS 모드 스위치 핀 설정
 
     // FreeRTOS 태스크 생성
-    xTaskCreatePinnedToCore(vControlTask, "ControlTask", 1024, NULL, 1, &g_controlTaskHandle, 0);   // 코어 0에 할당, 우선순위 1(낮음)
-    xTaskCreatePinnedToCore(vEncoderTask, "EncoderTask", 1024, NULL, 2, NULL, 1);  // 코어 1에 할당, 우선순위 2 (높음)
-    xTaskCreatePinnedToCore(vCommunicationTask, "CommunicationTask", 1024, NULL, 1, NULL, 1); // 코어 1에 할당, 우선순위 1 (낮음)
+    xTaskCreatePinnedToCore(vControlTask, "ControlTask", 1024, NULL, 1, NULL, 0);  // 제어 태스크 생성 (코어 0)
+    xTaskCreatePinnedToCore(vEncoderTask, "EncoderTask", 1024, NULL, 2, NULL, 1);  // 엔코더 태스크 생성 (코어 1)
+    xTaskCreatePinnedToCore(vCommunicationTask, "CommunicationTask", 1024, NULL, 1, NULL, 1);  // 통신 태스크 생성 (코어 1)
 }
 
 //======================= vControlTask 함수 =====================
 void vControlTask(void *pvParameters) { 
-    unsigned long last_time = 0;
-    unsigned long current_time = 0;
-    const unsigned long falling_debounce_delay = 500;
+    unsigned long last_time = 0;  // 마지막 실행 시간 저장 변수
+    unsigned long current_time = 0;  // 현재 시간 저장 변수
+    const unsigned long falling_debounce_delay = 500;  // 디바운스 지연 시간 설정
 
-    bool lastLeverState = LOW; // 레버 스위치의 이전 상태
+    bool lastLeverState = LOW;  // 레버 스위치의 이전 상태
 
-    Mode current_mode;
+    Mode current_mode;  // 현재 모드를 저장할 변수
 
-    // PID 게인 설정
-    float kp = 1.0;
-    float ki = 0.1;
-    float kd = 0.01;
+    float kp = 1.0;  // PID 제어의 비례 게인
+    float ki = 0.1;  // PID 제어의 적분 게인
+    float kd = 0.01;  // PID 제어의 미분 게인
 
-    for (;;) {
-      current_time = millis();
+    for (;;) {  // 무한 루프
+      current_time = millis();  // 현재 시간 업데이트
 
-      update_ASMS_Mode(&lastLeverState, current_time, falling_debounce_delay);
+      update_ASMS_Mode(&lastLeverState, current_time, falling_debounce_delay);  // ASMS 모드 업데이트
 
-      if((current_mode = check_ASMS_Mode(&lastLeverState))== EMERGENCY){
-          brake_servo.write(30);  // 비상 정지
-          vTaskDelay(100 / portTICK_PERIOD_MS); // 비상정지 모드에서는 CPU 부하를 낮추기 위해 0.1초 딜레이
+      if((current_mode = check_ASMS_mode())== EMERGENCY){  // 비상 모드 체크
+          brake_servo.write(30);  // 비상 정지 시 브레이크 30도 작동
+          vTaskDelay(100 / portTICK_PERIOD_MS);  // 0.1초 대기 (비상 모드에서 CPU 부하 줄이기)
       }
-      else if(current_mode == AUTONOMOUS){        
-        if (current_time - last_time >= control_time_interval) {
+      else if(current_mode == AUTONOMOUS){  // 자율주행 모드인 경우
+        if (current_time - last_time >= control_time_interval) {  // 제어 시간 간격이 지났는지 확인
 
-            float local_target_rpm;
-            int local_target_angle_int;
+            float local_target_rpm;  // 로컬 목표 RPM
+            int local_target_angle_int;  // 로컬 목표 각도
 
-            // 목표 값 보호용 뮤텍스
-            if (xSemaphoreTake(g_xMutexTargetValues, portMAX_DELAY) == pdTRUE) {
-                local_target_rpm = g_target_rpm;
-                local_target_angle_int = g_target_angle_int;
-                xSemaphoreGive(g_xMutexTargetValues);
+            if (xSemaphoreTake(g_xMutexTargetValues, portMAX_DELAY) == pdTRUE) {  // 목표 값 세마포어 획득
+                local_target_rpm = g_target_rpm;  // 목표 RPM 가져오기
+                local_target_angle_int = g_target_angle_int;  // 목표 각도 가져오기
+                xSemaphoreGive(g_xMutexTargetValues);  // 세마포어 해제
             } 
-            longitudinalControl(local_target_rpm, kp, ki, kd); // 종방향 제어 수행
+            longitudinalControl(local_target_rpm, kp, ki, kd);  // 종방향 제어 수행
             lateralControl(local_target_angle_int);  // 횡방향 제어 수행
 
-            last_time = current_time;  // 시간 업데이트
+            last_time = current_time;  // 마지막 실행 시간 업데이트
         }
       }
-      else{ // 수동 주행모드에서는 CPU 부하를 낮추기 위해 0.1초 딜레이
-        brake_servo.write(0);          // 브레이크 신호 0
-        analogWrite(MOTOR_PWM_PIN, 0); // 스로틀 신호 0
-        vTaskDelay(100 / portTICK_PERIOD_MS); 
-        } 
+      else{  // 수동 모드인 경우
+        brake_servo.write(0);  // 브레이크 해제
+        analogWrite(MOTOR_PWM_PIN, 0);  // 모터 PWM 출력 0으로 설정
+        vTaskDelay(100 / portTICK_PERIOD_MS);  // 0.1초 대기 (수동 모드에서 CPU 부하 줄이기)
+      } 
 
-      vTaskDelay(1 / portTICK_PERIOD_MS); // 짧은 지연으로 다른 태스크에 CPU 시간을 양보
+      vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms 대기(다른 태스크에게 CPU 시간 양보)
     }
 }
 
 //======================= vEncoderTask 함수 =====================
 void vEncoderTask(void *pvParameters) {
-    unsigned long last_time = 0;
-    unsigned long current_time = 0;
-    long pulse_count = 0;
+    unsigned long last_time = 0;  // 마지막 실행 시간 저장 변수
+    unsigned long current_time = 0;  // 현재 시간 저장 변수
+    long pulse_count = 0;  // 엔코더 펄스 수 저장 변수
 
-    for (;;) {
-        enc.loop(); // 타이머 인터럽트 대신 루프에서 호출
+    for (;;) {  // 무한 루프
+        enc.loop();  // 타이머 인터럽트 대신 루프에서 엔코더 값 읽기
 
-        current_time = millis();
-        if (current_time - last_time >= encoder_time_interval) {
+        current_time = millis();  // 현재 시간 업데이트
+        if (current_time - last_time >= encoder_time_interval) {  // 엔코더 읽기 간격이 지났는지 확인
             pulse_count = enc.getTicks();  // 엔코더에서 펄스 수 읽기
 
-            // 엔코더 RPM 보호용 뮤텍스
-            if (xSemaphoreTake(g_xMutexCurrentRPM, portMAX_DELAY) == pdTRUE) {  
-                g_current_rpm = (pulse_count / (float)ENCODER_RESOLUTION) * 60 * (1000 / (float)encoder_time_interval) * GEAR_RATIO;
-                xSemaphoreGive(g_xMutexCurrentRPM);  // 뮤텍스 해제
+            if (xSemaphoreTake(g_xMutexCurrentRPM, portMAX_DELAY) == pdTRUE) {  // 현재 RPM 세마포어 획득
+                g_current_rpm = (pulse_count / (float)ENCODER_RESOLUTION) * 60 * (1000 / (float)encoder_time_interval) * GEAR_RATIO;  // 현재 RPM 계산
+                xSemaphoreGive(g_xMutexCurrentRPM);  // 세마포어 해제
             }
 
-            enc.resetTicks();  // 펄스 카운트를 초기화
+            enc.resetTicks();  // 엔코더 펄스 카운트 초기화
 
-            last_time = current_time;  // 시간 업데이트
+            last_time = current_time;  // 마지막 실행 시간 업데이트
         }
-        // 주기적으로 실행
-        vTaskDelay(1 / portTICK_PERIOD_MS); // 짧은 지연으로 다른 태스크에 CPU 시간을 양보
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms 대기(다른 태스크에게 CPU 시간 양보)
     }
 }
 
 //======================= vCommunicationTask 함수 ===============
 void vCommunicationTask(void *pvParameters) { 
-    unsigned long last_time = 0;
-    unsigned long current_time = 0;
+    unsigned long last_time = 0;  // 마지막 실행 시간 저장 변수
+    unsigned long current_time = 0;  // 현재 시간 저장 변수
 
-    for (;;) {
-        current_time = millis();
-        if (current_time - last_time >= communication_time_interval) {
+    for (;;) {  // 무한 루프
+        current_time = millis();  // 현재 시간 업데이트
+        if (current_time - last_time >= communication_time_interval) {  // 통신 시간 간격이 지났는지 확인
 
-            if (!nh.connected()) { // PC와 연결 해제시 예외처리
-                deactivateAutonomousMode();  // 수동 주행 모드 돌입
-                while (!nh.connected()) {
-                    nh.spinOnce();
-                    Serial.println("Reconnecting to ROS...");
-                    delay(1000);
+            if (!nh.connected()) {  // ROS와 연결이 끊겼는지 확인
+                deactivateAutonomousMode();  // 자율주행 모드 해제
+                while (!nh.connected()) {  // 다시 연결될 때까지 대기
+                    nh.spinOnce();  // ROS 통신 유지
+                    Serial.println("Reconnecting to ROS...");  // 재연결 시도 메시지 출력
+                    delay(1000);  // 1초 대기
                 }
-                activateAutonomousMode();   // 자율주행 모드 재시작
+                activateAutonomousMode();  // 자율주행 모드 재활성화
             }
 
-            // 엔코더 RPM 변수 보호용 뮤텍스
-            if (xSemaphoreTake(g_xMutexCurrentRPM, portMAX_DELAY) == pdTRUE) {  
-                feedback_msg.current_rpm = g_current_rpm;  // 피드백 메시지에 현재 RPM 할당
-                xSemaphoreGive(g_xMutexCurrentRPM);  // 뮤텍스 해제
+            if (xSemaphoreTake(g_xMutexCurrentRPM, portMAX_DELAY) == pdTRUE) {  // 현재 RPM 세마포어 획득
+                feedback_msg.current_rpm = g_current_rpm;  // 피드백 메시지에 현재 RPM 저장
+                xSemaphoreGive(g_xMutexCurrentRPM);  // 세마포어 해제
             }
 
-            pub.publish(&feedback_msg);  // 현재 엔코더 RPM 값 퍼블리시
+            pub.publish(&feedback_msg);  // 피드백 메시지 퍼블리시
             nh.spinOnce();  // ROS 통신 유지
 
-            last_time = current_time;  // 시간 업데이트
+            last_time = current_time;  // 마지막 실행 시간 업데이트
         }
-        // 주기적으로 실행
-        vTaskDelay(1 / portTICK_PERIOD_MS); // 짧은 지연으로 다른 태스크에 CPU 시간을 양보
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms 대기(다른 태스크에게 CPU 시간 양보)
     }
 }
 
 //======================= 커스텀 메시지 콜백 함수 =====================
 void controlCallback(const custom_msg_pkg::ControlMsg& msg) {
-    // 목표 값 보호용 뮤텍스
-    if (xSemaphoreTake(g_xMutexTargetValues, portMAX_DELAY) == pdTRUE) {
-        g_target_rpm = msg.target_rpm;
-        g_target_angle_int = msg.target_angle;
-        xSemaphoreGive(g_xMutexTargetValues);
+    if (xSemaphoreTake(g_xMutexTargetValues, portMAX_DELAY) == pdTRUE) {  // 목표 값 세마포어 획득
+        g_target_rpm = msg.target_rpm;  // 수신된 메시지에서 목표 RPM 값 설정
+        g_target_angle_int = msg.target_angle;  // 수신된 메시지에서 목표 각도 설정
+        xSemaphoreGive(g_xMutexTargetValues);  // 세마포어 해제
     }
 }
 
 //======================= 종방향 제어 함수 =======================
 void longitudinalControl(float target_rpm, float kp, float ki, float kd) {
-    int pid_output = calculatePID(target_rpm, kp, ki, kd);  // PID 계산
+    int pid_output = calculatePID(target_rpm, kp, ki, kd);  // PID 제어 값 계산
 
-    if (pid_output >= 0) {
-        analogWrite(MOTOR_PWM_PIN, pid_output); // 모터 제어
-    } else {
-        analogWrite(MOTOR_PWM_PIN, 0); // 모터 PWM 출력 0으로 설정
-        int brake_angle = getBrakeAngle(abs(pid_output)); // 브레이크 각도 결정
+    if (pid_output >= 0) {  // PID 출력이 양수인 경우 (모터 제어)
+        analogWrite(MOTOR_PWM_PIN, pid_output);  // 모터 PWM 제어
+    } else {  // PID 출력이 음수인 경우 (브레이크 제어)
+        analogWrite(MOTOR_PWM_PIN, 0);  // 모터 PWM 출력 0으로 설정
+        int brake_angle = getBrakeAngle(abs(pid_output));  // 브레이크 각도 계산
         brake_servo.write(brake_angle);  // 서보모터로 브레이크 제어
     }
 }
 
-
 //======================= 횡방향 제어 함수 =======================
 void lateralControl(int targetAngleInt) {
-    // 횡방향 제어: CAN 메시지 전송
-    CANMessage frame;
-    frame.id = 0x06000001;
-    frame.ext = true; // 확장 ID 사용 여부 설정
-    frame.rtr = false; // 데이터 프레임
-    frame.len = 8; // 보낼 데이터의 길이
+    CANMessage frame;  // CAN 메시지 객체 생성
+    frame.id = 0x06000001;  // 메시지 ID 설정
+    frame.ext = true;  // 확장 ID 사용 설정
+    frame.rtr = false;  // 데이터 프레임 설정
+    frame.len = 8;  // 데이터 길이 설정
 
-    // 바이트 순서를 맞추기 위해 명령어와 데이터를 결합
-    frame.data[0] = 0x23;
-    frame.data[1] = 0x02;
-    frame.data[2] = 0x20;
-    frame.data[3] = 0x01;
-    frame.data[4] = (targetAngleInt >> 24) & 0xFF;
-    frame.data[5] = (targetAngleInt >> 16) & 0xFF;
-    frame.data[6] = (targetAngleInt >> 8) & 0xFF;
-    frame.data[7] = targetAngleInt & 0xFF;
+    frame.data[0] = 0x23;  // 데이터 바이트 설정 (명령어)
+    frame.data[1] = 0x02;  // 데이터 바이트 설정 (명령어)
+    frame.data[2] = 0x20;  // 데이터 바이트 설정 (명령어)
+    frame.data[3] = 0x01;  // 데이터 바이트 설정 (명령어)
+    frame.data[4] = (targetAngleInt >> 24) & 0xFF;  // 목표 각도 상위 바이트 설정
+    frame.data[5] = (targetAngleInt >> 16) & 0xFF;  // 목표 각도 중상위 바이트 설정
+    frame.data[6] = (targetAngleInt >> 8) & 0xFF;  // 목표 각도 중하위 바이트 설정
+    frame.data[7] = targetAngleInt & 0xFF;  // 목표 각도 하위 바이트 설정
 
-    // 전송
-    if (ACAN_ESP32::can.tryToSend(frame)) {
-        Serial.println("데이터 전송 성공");
-        Serial.print("전송된 데이터: ");
-        for (int i = 0; i < 8; i++) {
+    if (ACAN_ESP32::can.tryToSend(frame)) {  // CAN 메시지 전송 시도
+        Serial.println("데이터 전송 성공");  // 전송 성공 시 메시지 출력
+        Serial.print("전송된 데이터: ");  // 전송된 데이터 출력
+        for (int i = 0; i < 8; i++) {  // 데이터 바이트 출력
             Serial.print(frame.data[i], HEX);
             Serial.print(" ");
         }
@@ -320,142 +303,149 @@ void lateralControl(int targetAngleInt) {
 
 //======================= getBrakeAngle 함수 ====================
 int getBrakeAngle(float pid_output) {
-    int angle = 0; // 기본값 0도 (브레이크 해제)
+    int angle = 0;  // 기본 브레이크 각도 0도 (브레이크 해제)
 
-    switch ((int)pid_output) {
+    switch ((int)pid_output) {  // PID 출력에 따라 브레이크 각도 설정
         case 0 ... 9:
-            angle = 0; // pid_output이 0에서 9 사이일 때 브레이크 각도 0도
+            angle = 0;  // PID 출력이 0~9일 때 브레이크 각도 0도
             break;
         case 10 ... 19:
-            angle = 15; // pid_output이 10에서 19 사이일 때 브레이크 각도 15도
+            angle = 15;  // PID 출력이 10~19일 때 브레이크 각도 15도
             break;
         case 20 ... 29:
-            angle = 30; // pid_output이 20에서 29 사이일 때 브레이크 각도 30도
+            angle = 30;  // PID 출력이 20~29일 때 브레이크 각도 30도
             break;
         default:
-            angle = 30; // pid_output이 30 이상일 때도 브레이크 각도 30도
+            angle = 30;  // PID 출력이 30 이상일 때 브레이크 각도 30도
             break;
     }
 
-    return angle;
+    return angle;  // 계산된 브레이크 각도 반환
 }
 
 //======================= calculatePID 함수 =====================
 float calculatePID(float target_rpm, float kp, float ki, float kd) {
-    static float last_error = 0.0;
-    static float integral = 0.0;
+    static float last_error = 0.0;  // 이전 오차 값 저장 변수
+    static float integral = 0.0;  // 적분 값 저장 변수
 
-    // 엔코더 RPM 보호용 뮤텍스
-    float current_rpm = 0.0;
-    if (xSemaphoreTake(g_xMutexCurrentRPM, portMAX_DELAY) == pdTRUE) {
-        current_rpm = g_current_rpm;
-        xSemaphoreGive(g_xMutexCurrentRPM);  // 뮤텍스 해제
+    float current_rpm = 0.0;  // 현재 RPM 값 저장 변수
+    if (xSemaphoreTake(g_xMutexCurrentRPM, portMAX_DELAY) == pdTRUE) {  // 현재 RPM 세마포어 획득
+        current_rpm = g_current_rpm;  // 현재 RPM 값 가져오기
+        xSemaphoreGive(g_xMutexCurrentRPM);  // 세마포어 해제
     }
 
-    float error = target_rpm - current_rpm;
-    integral += error * control_time_interval;
-    float derivative = (error - last_error) / control_time_interval;
-    float output = (kp * error) + (ki * integral) + (kd * derivative);
-    last_error = error;
-    return output;
-}
-
-// 캔 통신 초기화 및 설정 함수 정의
-void setupCANCommunication(int rxPin, int txPin, uint32_t baudRate) {
-  // 캔통신의 통신속도를 설정하는 부분
-  ACAN_ESP32_Settings settings(baudRate);
-
-  // 실제로 통신할거기 때문에 루프백모드를 설정하면 안된다
-  // settings.mRequestedCANMode = ACAN_ESP32_Settings::LoopBackMode;
-
-  // RX와 TX 핀 설정
-  settings.mRxPin = (gpio_num_t)rxPin;  // 여기서 rxPin은 정수값 17
-  settings.mTxPin = (gpio_num_t)txPin;  // 여기서 txPin은 정수값 16
-
-  // 통신속도와 연결핀을 기준으로 캔통신 초기화
-  const uint32_t ret = ACAN_ESP32::can.begin(settings);
-
-  // 캔통신 설정을 시리얼 모니터에 출력
-  printCANSettings(settings, ret);
-}
-
-// 캔 통신 설정 출력 함수 정의
-void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result) {
-  if (result == 0) {    
-    Serial.print("Bit Rate prescaler: ");
-    Serial.println(settings.mBitRatePrescaler);
-    Serial.print("Time Segment 1:     ");
-    Serial.println(settings.mTimeSegment1);
-    Serial.print("Time Segment 2:     ");
-    Serial.println(settings.mTimeSegment2);
-    Serial.print("RJW:                ");
-    Serial.println(settings.mRJW);
-    Serial.print("Triple Sampling:    ");
-    Serial.println(settings.mTripleSampling ? "yes" : "no");
-    Serial.print("Actual bit rate:    ");
-    Serial.print(settings.actualBitRate());
-    Serial.println(" bit/s");
-    Serial.print("Exact bit rate ?    ");
-    Serial.println(settings.exactBitRate() ? "yes" : "no");
-    Serial.print("Distance            ");
-    Serial.print(settings.ppmFromDesiredBitRate());
-    Serial.println(" ppm");
-    Serial.print("Sample point:       ");
-    Serial.print(settings.samplePointFromBitStart());
-    Serial.println("%");
-    Serial.println("Configuration OK!");
-  } else {
-    Serial.print("Configuration error 0x");
-    Serial.println(result, HEX);    
-  }
+    float error = target_rpm - current_rpm;  // 현재 RPM과 목표 RPM의 차이 계산 (오차)
+    integral += error * control_time_interval;  // 적분 계산 (누적 오차)
+    float derivative = (error - last_error) / control_time_interval;  // 미분 계산 (오차 변화율)
+    float output = (kp * error) + (ki * integral) + (kd * derivative);  // PID 출력 계산
+    last_error = error;  // 이전 오차 값 업데이트
+    return output;  // 계산된 PID 출력 반환
 }
 
 //======================= E-Stop 스위치 ISR ====================
 
 void IRAM_ATTR EStop_Debounce(bool activate) {
-    static unsigned long last_time = 0;
-    unsigned long current_time = millis();
-    if (current_time - last_time >= debounceDelay) {
-        g_estopActivated = activate;
-        last_time = current_time;
+    static unsigned long last_time = 0;  // 마지막 인터럽트 처리 시간 저장 변수
+    unsigned long current_time = millis();  // 현재 시간 저장 변수
+    if (current_time - last_time >= debounceDelay) {  // 디바운스 지연 시간 체크
+        g_estopActivated = activate;  // E-Stop 활성화 상태 업데이트
+        last_time = current_time;  // 마지막 처리 시간 업데이트
     }
 }
 
 void IRAM_ATTR EStop_Activate_ISR() {
-    portENTER_CRITICAL_ISR();  // 인터럽트 비활성화
-    EStop_Debounce(true);      // E-Stop 활성화
-    portEXIT_CRITICAL_ISR();   // 인터럽트 활성화
+    portENTER_CRITICAL_ISR(&mux);  // 인터럽트 비활성화
+    EStop_Debounce(true);  // E-Stop 활성화 처리
+    portEXIT_CRITICAL_ISR(&mux);  // 인터럽트 활성화
 }
 
 void IRAM_ATTR EStop_Deactivate_ISR() {
-    portENTER_CRITICAL_ISR();  // 인터럽트 비활성화
-    EStop_Debounce(false);     // E-Stop 비활성화
-    portEXIT_CRITICAL_ISR();   // 인터럽트 활성화
+    portENTER_CRITICAL_ISR(&mux);  // 인터럽트 비활성화
+    EStop_Debounce(false);  // E-Stop 비활성화 처리
+    portEXIT_CRITICAL_ISR(&mux);  // 인터럽트 활성화
+
+    if (xSemaphoreTakeFromISR(modeSemaphore, NULL)) {
+        g_currentMode = AUTONOMOUS;  // 자율주행 모드로 복귀
+        xSemaphoreGiveFromISR(modeSemaphore, NULL);
+    }
 }
 
 //======================== 폴링 스위치 ==========================
 void update_ASMS_Mode(bool* lastLeverState, unsigned long current_time, const unsigned long falling_debounce_delay) {
-
-    static unsigned long last_time = 0;
-    if(current_time - last_time >= falling_debounce_delay){
-      bool currentLeverState = digitalRead(ASMS_MODE_PIN);
-      if (currentLeverState != *lastLeverState) {
-          if (currentLeverState == LOW && g_currentMode == AUTONOMOUS) {
-              g_currentMode = MANUAL;
-              *lastLeverState = currentLeverState; // 이전 상태 업데이트
-          } else if (currentLeverState == HIGH && g_currentMode == MANUAL) {
-              g_currentMode = AUTONOMOUS;
-              *lastLeverState = currentLeverState; // 이전 상태 업데이트
+    static unsigned long last_time = 0;  // 마지막 스위치 처리 시간 저장 변수
+    if(current_time - last_time >= falling_debounce_delay){  // 디바운스 지연 시간 체크
+      bool currentLeverState = digitalRead(ASMS_MODE_PIN);  // 현재 스위치 상태 읽기
+      if (currentLeverState != *lastLeverState) {  // 스위치 상태가 변경되었는지 확인
+          if (currentLeverState == LOW && g_currentMode == AUTONOMOUS) {  // 자율주행 모드에서 수동 모드로 전환
+              g_currentMode = MANUAL;  // 모드 업데이트
+              *lastLeverState = currentLeverState;  // 스위치 상태 업데이트
+          } else if (currentLeverState == HIGH && g_currentMode == MANUAL) {  // 수동 모드에서 자율주행 모드로 전환
+              g_currentMode = AUTONOMOUS;  // 모드 업데이트
+              *lastLeverState = currentLeverState;  // 스위치 상태 업데이트
           }
       }
     }
 }
 
-Mode check_ASMS_mode(){ // 나중에 뮤텍스로 보호하기
-    Mode current_mode = g_currentMode;
-    if(g_estopActivated) current_mode = EMERGENCY;
-    return current_mode; 
+Mode check_ASMS_mode(){  // 현재 모드 체크 함수
+    Mode current_mode = g_currentMode;  // 현재 모드 저장
+    if(g_estopActivated) current_mode = EMERGENCY;  // E-Stop이 활성화된 경우 비상 모드로 전환
+    return current_mode;  // 현재 모드 반환
+}
+
+//======================= CAN 통신 설정 함수 정의 =====================
+void setupCANCommunication(int rxPin, int txPin, uint32_t baudRate) {
+  ACAN_ESP32_Settings settings(baudRate);  // CAN 통신 설정 객체 생성
+
+  settings.mRxPin = (gpio_num_t)rxPin;  // RX 핀 설정
+  settings.mTxPin = (gpio_num_t)txPin;  // TX 핀 설정
+
+  const uint32_t ret = ACAN_ESP32::can.begin(settings);  // CAN 통신 초기화
+
+  printCANSettings(settings, ret);  // CAN 통신 설정 디버깅 출력
+}
+
+//======================= CAN 통신 설정 출력 함수 정의 =====================
+void printCANSettings(const ACAN_ESP32_Settings& settings, uint32_t result) {
+  if (result == 0) {    
+    Serial.print("Bit Rate prescaler: ");
+    Serial.println(settings.mBitRatePrescaler);  // 비트율 프리스케일러 출력
+    Serial.print("Time Segment 1:     ");
+    Serial.println(settings.mTimeSegment1);  // 시간 세그먼트 1 출력
+    Serial.print("Time Segment 2:     ");
+    Serial.println(settings.mTimeSegment2);  // 시간 세그먼트 2 출력
+    Serial.print("RJW:                ");
+    Serial.println(settings.mRJW);  // 재동기화 점퍼 윈도우 출력
+    Serial.print("Triple Sampling:    ");
+    Serial.println(settings.mTripleSampling ? "yes" : "no");  // 트리플 샘플링 여부 출력
+    Serial.print("Actual bit rate:    ");
+    Serial.print(settings.actualBitRate());  // 실제 비트율 출력
+    Serial.println(" bit/s");
+    Serial.print("Exact bit rate ?    ");
+    Serial.println(settings.exactBitRate() ? "yes" : "no");  // 정확한 비트율 여부 출력
+    Serial.print("Distance            ");
+    Serial.print(settings.ppmFromDesiredBitRate());  // 비트율과의 거리 출력
+    Serial.println(" ppm");
+    Serial.print("Sample point:       ");
+    Serial.print(settings.samplePointFromBitStart());  // 샘플링 지점 출력
+    Serial.println("%");
+    Serial.println("Configuration OK!");
+  } else {
+    Serial.print("Configuration error 0x");
+    Serial.println(result, HEX);  // 설정 오류 시 에러 코드 출력
+  }
+}
+
+void deactivateAutonomousMode() {
+    Serial.println("Autonomous mode deactivated");
+    // 자율주행 모드 비활성화 관련 로직 추가
+}
+
+void activateAutonomousMode() {
+    Serial.println("Autonomous mode activated");
+    // 자율주행 모드 활성화 관련 로직 추가
 }
 
 
-void loop() {}
+void loop() {}  // 메인 루프(실제로는 사용되지 않음, 모든 작업은 태스크에서 수행)
+
