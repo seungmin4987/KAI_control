@@ -1,3 +1,5 @@
+#include <Arduino.h>
+#include <TM1637Display.h>
 #include <freertos/FreeRTOS.h>  // FreeRTOS 기본 헤더 파일
 #include <freertos/task.h>  // FreeRTOS 태스크 관리 헤더 파일
 #include <freertos/semphr.h>  // FreeRTOS 세마포어 관리 헤더 파일
@@ -8,14 +10,22 @@
 #include <custom_msg_pkg/ControlMsg.h>   // 커스텀 메시지: ControlMsg를 위한 헤더 파일
 #include <custom_msg_pkg/FeedbackMsg.h>  // 커스텀 메시지: FeedbackMsg를 위한 헤더 파일
 
-//=======================상수 정의 ========================================================
+// TM1637 디스플레이 핀 설정
+#define CLK 25
+#define DIO 26
 
+TM1637Display display(CLK, DIO);
+
+//=======================상수 정의 ========================================================
 const unsigned long control_time_interval = 100;  // 제어 태스크 실행 간격(0.1초)
 const unsigned long encoder_time_interval = 100;  // 엔코더 데이터 읽기 간격(0.1초)
 const unsigned long communication_time_interval = 100;  // 통신 태스크 실행 간격(0.1초)
 const float GEAR_RATIO = 5.0;  // 기어비 설정
 const int ENCODER_RESOLUTION = 1024;  // 엔코더 분해능(한 바퀴당 펄스 수)
 const int debounceDelay = 50;  // 스위치 디바운스 지연 시간(밀리초)
+
+const int pwmFreq = 5000;     // PWM 주파수 (5kHz)
+const int pwmResolution = 12; // PWM 해상도 (12비트: 0~4095 범위)
 
 enum Mode { AUTONOMOUS, EMERGENCY, MANUAL };  // 차량 모드 정의(AUTONOMOUS: 자율주행, EMERGENCY: 비상, MANUAL: 수동)
 
@@ -74,6 +84,31 @@ float g_target_rpm = 0.0;  // 목표 RPM 값
 int g_target_angle_int = 0;  // 목표 핸들 각도 값
 //==========================================================================================
 
+// 디스플레이에 RPM을 표시하는 함수
+void displayRPM(float rpm) {
+  display.clear();
+
+  int roundedRPM = (int)(rpm * 100 + 0.5);  // 소수 둘째 자리에서 반올림
+  int integerPart = roundedRPM / 100;       // 정수 부분
+  int firstDecimalPart = (roundedRPM / 10) % 10;  // 첫 번째 소수 부분
+  int secondDecimalPart = roundedRPM % 10;  // 두 번째 소수 부분
+
+  uint8_t data[4] = {0x00, 0x00, 0x00, 0x00};  // 디스플레이 데이터를 초기화
+
+  if (integerPart >= 10) {
+    data[0] = display.encodeDigit(integerPart / 10);  // 10의 자리
+    data[1] = display.encodeDigit(integerPart % 10) | 0b10000000;  // 1의 자리, 소수점 포함
+    data[2] = display.encodeDigit(firstDecimalPart);  // 첫 번째 소수 자리
+    data[3] = display.encodeDigit(secondDecimalPart); // 두 번째 소수 자리
+  } else {
+    data[0] = display.encodeDigit(integerPart);  // 1의 자리
+    data[1] = display.encodeDigit(firstDecimalPart) | 0b10000000;  // 첫 번째 소수 자리, 소수점 포함
+    data[2] = display.encodeDigit(secondDecimalPart);  // 두 번째 소수 자리
+  }
+
+  display.setSegments(data);  // 디스플레이에 데이터 전송
+}
+
 //=================================함수 선언부 ===============================================
 void longitudinalControl(float target_rpm, float kp, float ki, float kd);  // 종방향 제어 함수 선언
 float calculatePID(float target_rpm, float kp, float ki, float kd);  // PID 계산 함수 선언
@@ -98,6 +133,10 @@ void setup() {
     Serial.begin(115200);  // 시리얼 통신 초기화
 
     setupCANCommunication(STEERING_CAN_RX, STEERING_CAN_TX, 250000UL);  // CAN 통신 초기화 및 설정 (250kbps)
+
+    display.setBrightness(0x0f);  // 디스플레이 밝기 설정
+
+    ledcAttach(MOTOR_PWM_PIN, pwmFreq, pwmResolution);
 
     if (enc.init()) {  // 엔코더 초기화 시도
         Serial.println("Encoder Initialization OK");  // 초기화 성공 시 메시지 출력
@@ -177,14 +216,14 @@ void vControlTask(void *pvParameters) {
                 xSemaphoreGive(g_xMutexTargetValues);  // 세마포어 해제
             } 
             longitudinalControl(local_target_rpm, kp, ki, kd);  // 종방향 제어 수행
-            lateralControl(local_target_angle_int);  // 횡방향 제어 수행
+            //lateralControl(local_target_angle_int);  // 횡방향 제어 수행
 
             last_time = current_time;  // 마지막 실행 시간 업데이트
         }
       }
       else{  // 수동 모드인 경우
         brake_servo.write(0);  // 브레이크 해제
-        analogWrite(MOTOR_PWM_PIN, 0);  // 모터 PWM 출력 0으로 설정
+        ledcWrite(MOTOR_PWM_PIN, 0);  // 모터 PWM 출력 0으로 설정
         vTaskDelay(100 / portTICK_PERIOD_MS);  // 0.1초 대기 (수동 모드에서 CPU 부하 줄이기)
       } 
 
@@ -222,6 +261,7 @@ void vEncoderTask(void *pvParameters) {
 void vCommunicationTask(void *pvParameters) { 
     unsigned long last_time = 0;  // 마지막 실행 시간 저장 변수
     unsigned long current_time = 0;  // 현재 시간 저장 변수
+    float local_rpm = 0;
 
     for (;;) {  // 무한 루프
         current_time = millis();  // 현재 시간 업데이트
@@ -238,10 +278,12 @@ void vCommunicationTask(void *pvParameters) {
             }
 
             if (xSemaphoreTake(g_xMutexCurrentRPM, portMAX_DELAY) == pdTRUE) {  // 현재 RPM 세마포어 획득
-                feedback_msg.current_rpm = g_current_rpm;  // 피드백 메시지에 현재 RPM 저장
-                xSemaphoreGive(g_xMutexCurrentRPM);  // 세마포어 해제
+                local_rpm = g_current_rpm;  // 전역 변수에서 현재 RPM 값을 로컬 변수로 저장
+                xSemaphoreGive(g_xMutexCurrentRPM);  // 세마포어 해제       
             }
 
+            feedback_msg.current_rpm = local_rpm;  // 피드백 메시지에 로컬 변수의 RPM 값 저장
+            displayRPM(local_rpm);
             pub.publish(&feedback_msg);  // 피드백 메시지 퍼블리시
             nh.spinOnce();  // ROS 통신 유지
 
@@ -250,6 +292,7 @@ void vCommunicationTask(void *pvParameters) {
         vTaskDelay(1 / portTICK_PERIOD_MS);  // 1ms 대기(다른 태스크에게 CPU 시간 양보)
     }
 }
+
 
 //======================= 커스텀 메시지 콜백 함수 =====================
 void controlCallback(const custom_msg_pkg::ControlMsg& msg) {
@@ -265,9 +308,10 @@ void longitudinalControl(float target_rpm, float kp, float ki, float kd) {
     int pid_output = calculatePID(target_rpm, kp, ki, kd);  // PID 제어 값 계산
 
     if (pid_output >= 0) {  // PID 출력이 양수인 경우 (모터 제어)
-        analogWrite(MOTOR_PWM_PIN, pid_output);  // 모터 PWM 제어
+        brake_servo.write(0);
+        ledcWrite(MOTOR_PWM_PIN, pid_output);  // 모터 PWM 제어
     } else {  // PID 출력이 음수인 경우 (브레이크 제어)
-        analogWrite(MOTOR_PWM_PIN, 0);  // 모터 PWM 출력 0으로 설정
+        ledcWrite(MOTOR_PWM_PIN, 0);  // 모터 PWM 출력 0으로 설정
         int brake_angle = getBrakeAngle(abs(pid_output));  // 브레이크 각도 계산
         brake_servo.write(brake_angle);  // 서보모터로 브레이크 제어
     }
@@ -293,7 +337,7 @@ void lateralControl(int targetAngleInt) {
     if (ACAN_ESP32::can.tryToSend(frame)) {  // CAN 메시지 전송 시도
         Serial.println("데이터 전송 성공");  // 전송 성공 시 메시지 출력
         Serial.print("전송된 데이터: ");  // 전송된 데이터 출력
-        for (int i = 0; i < 8; i++) {  // 데이터 바이트 출력
+        for (int i = 0; i<8; i++) {  // 데이터 바이트 출력
             Serial.print(frame.data[i], HEX);
             Serial.print(" ");
         }
@@ -445,7 +489,6 @@ void activateAutonomousMode() {
     Serial.println("Autonomous mode activated");
     // 자율주행 모드 활성화 관련 로직 추가
 }
-
 
 void loop() {}  // 메인 루프(실제로는 사용되지 않음, 모든 작업은 태스크에서 수행)
 
