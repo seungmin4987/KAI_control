@@ -67,10 +67,6 @@
     python3 ros_kai_ws/src/custom_msg_pkg/scripts/sine_input.py
     python3 ros_kai_ws/src/custom_msg_pkg/scripts/step_input.py
 
-
-
-
-
 ## 참고
 - 이 코드는 ESP32와 ROS 기반 자율주행 차량 개발을 목적으로 작성되었습니다.
 - 기능 개선 및 추가를 위해 코드 리뷰와 테스트를 권장합니다.
