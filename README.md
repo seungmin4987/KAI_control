@@ -16,7 +16,13 @@
 
 ---
 
-### 3. `ros_kai_ws/src`
+### 3. `integrated_controller`
+- **esp32_control/esp32_control.ino**: 종방향 제어기 코드입니다.
+- 대회때 사용한 종방향 제어, 모드 전환 스위치,각종 액추에이터 제어 코드.
+
+---
+
+### 4. `ros_kai_ws/src`
 #### **can_bridge_pkg**
 - **스티어링 모터와 ROS 간 통신**을 위한 CAN 브릿지 패키지입니다.
 - 주요 구성:
@@ -50,6 +56,7 @@
    ./1_open_can_port.sh
    ./2_activate_can_bridge.sh
    ./3_activate_rosserial.sh
+   
 2. `ROS 노드 실행` 
     ```bash
     roslaunch can_bridge_pkg hardware_activate.launch
