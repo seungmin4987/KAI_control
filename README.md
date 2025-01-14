@@ -1,5 +1,5 @@
 # KAI Control Project
-
+자작자동차 동아리 '팀카이'에서 사용했던, 하드웨어 제어 코드
 ## 각 패키지 설명
 
 ### 1. `control_setup`
