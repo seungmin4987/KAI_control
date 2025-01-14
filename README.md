@@ -1,11 +1,6 @@
 # KAI Control Project
 
-## 디렉토리 구조
-
-
----
-
-## 디렉토리 설명
+## 각 패키지 설명
 
 ### 1. `control_setup`
 - **1_open_can_port.sh**: CAN 포트를 활성화하는 스크립트입니다.
