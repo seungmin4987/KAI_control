@@ -1,0 +1,11 @@
+<launch>
+  <!-- CAN bridge node 실행 -->
+  <node pkg="can_bridge_pkg" type="can_bridge_node" name="can_bridge_node" output="screen" />
+
+  <!-- rosserial 연결 노드 실행 -->
+  <node pkg="rosserial_python" type="serial_node.py" name="rosserial_node" output="screen">
+    <param name="port" value="/dev/ttyUSB0" />
+    <param name="baud" value="57600" />
+  </node>
+</launch>
+
